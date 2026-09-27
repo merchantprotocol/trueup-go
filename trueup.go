@@ -204,7 +204,7 @@ type Run struct {
 		ID   string `json:"id"`
 		Name string `json:"name"`
 	} `json:"model"`
-	Headline *string           `json:"headline"`
+	Headline *string            `json:"headline"`
 	Stats    map[string]float64 `json:"stats"`
 	// Findings is how many findings the run has.
 	Findings  *int    `json:"findings"`

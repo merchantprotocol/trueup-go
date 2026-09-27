@@ -3,9 +3,9 @@
 package trueup_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/csv"
-	"bytes"
 	"errors"
 	"os"
 	"strings"
