@@ -95,6 +95,25 @@ for _, f := range res.Findings {
 
 `Kind` is `match`, `unsure_match` (a person should check), `only_left` or `only_right`. `Details.Pairs` lists every pair with its confidence. Like `Reconcile`, it takes `File`, `Content` or `Rows`; `MatchFiles` picks the pair; `MatchStored` works on stored files (with a saved model); and `Details.Weights` can be passed back as `MatchOptions.Weights` to match next month's lists the same way. One analysis per call.
 
+## Audit
+
+Find what doesn't add up. Send text documents with labeled amounts (invoices, statements, schedules; about 4 or more of a kind) and TrueUp learns the arithmetic each kind obeys from the documents themselves, then flags the ones that break it. Send one table and it checks its rows the same way (qty × unit price = amount), and flags repeated rows.
+
+```go
+res, err := client.Audit(ctx, []trueup.Table{trueup.File("inv-1041.txt"), /* … */ trueup.File("inv-1046.txt")}, nil)
+fmt.Println(res.Headline)
+// 1 of 6 documents don't add up; 0 more to review (5 laws learned).
+for _, f := range res.Findings {
+	fmt.Println(f.Subject, *f.Amount, f.Detail)
+}
+// inv-1045.txt 200 subtotal + tax amount = total: 4,837.84 vs 5,037.84
+
+// Next month, even one invoice at a time, against the same laws:
+client.Audit(ctx, []trueup.Table{trueup.File("inv-1050.txt")}, &trueup.AuditOptions{Weights: res.Details.Weights})
+```
+
+`AuditStored(ctx, fileIDs, model)` audits stored files. One analysis per call.
+
 ## Stored files, runs and saved models
 
 Files uploaded to your team stay there (you'll also see them in the dashboard). Runs on stored files are kept, and what a run learned can be saved as a model:
@@ -175,7 +194,7 @@ trueup.NewClient(
 The tests run in Docker against the live API:
 
 ```bash
-export TRUEUP_API_KEY=tu_live_...   # a key for a test team (each run uses 6 analyses)
+export TRUEUP_API_KEY=tu_live_...   # a key for a test team (each run uses 8 analyses)
 just test                            # or: docker compose run --rm test
 ```
 
