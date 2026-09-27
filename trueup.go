@@ -31,7 +31,7 @@ import (
 )
 
 // Version of this SDK.
-const Version = "0.2.0"
+const Version = "0.3.0"
 
 // DefaultBaseURL is the hosted TrueUp API.
 const DefaultBaseURL = "https://trueup-cloud.merchantprotocol.workers.dev"
@@ -175,6 +175,67 @@ type Plan struct {
 		HardCap              bool   `json:"hard_cap"`
 		OverageMicrosPerUnit *int   `json:"overage_micros_per_unit"`
 	} `json:"limits"`
+}
+
+// MatchResult is the answer to a match call.
+type MatchResult struct {
+	Analysis string             `json:"analysis"`
+	Title    string             `json:"title"`
+	Headline string             `json:"headline"`
+	Stats    map[string]float64 `json:"stats"`
+	// Findings: Kind is match, unsure_match (a person should check), only_left or only_right.
+	Findings []Finding    `json:"findings"`
+	Details  MatchDetails `json:"details"`
+	Inputs   []string     `json:"inputs"`
+	Engine   string       `json:"engine"`
+	// RunID is the kept run, for MatchStored.
+	RunID string `json:"run_id"`
+}
+
+// MatchDetails are how the columns lined up, every pair, and what was learned.
+type MatchDetails struct {
+	Columns struct {
+		Left  map[string]string `json:"left"`
+		Right map[string]string `json:"right"`
+	} `json:"columns"`
+	// Pairs are [left id, right id, confidence].
+	Pairs []MatchPair `json:"pairs"`
+	Model struct {
+		Learned bool `json:"learned"`
+	} `json:"model"`
+	// Weights: pass back as MatchOptions.Weights to match the same way without learning.
+	Weights json.RawMessage `json:"weights"`
+}
+
+// MatchPair is one pair: the left record's id, the right record's id, and the confidence.
+type MatchPair struct {
+	LeftID     string
+	RightID    string
+	Confidence float64
+}
+
+// UnmarshalJSON reads a pair from the API's [left id, right id, confidence].
+func (p *MatchPair) UnmarshalJSON(b []byte) error {
+	var raw []json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	if len(raw) != 3 {
+		return fmt.Errorf("trueup: a match pair has %d parts, want 3", len(raw))
+	}
+	if err := json.Unmarshal(raw[0], &p.LeftID); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(raw[1], &p.RightID); err != nil {
+		return err
+	}
+	return json.Unmarshal(raw[2], &p.Confidence)
+}
+
+// MatchOptions are optional settings for a match call.
+type MatchOptions struct {
+	// Weights is Details.Weights from an earlier match: apply what was learned then instead of learning again.
+	Weights json.RawMessage
 }
 
 // StoredFile is a file stored in the team (uploaded through the API or the dashboard).
@@ -414,6 +475,67 @@ func (c *Client) ReconcileFiles(ctx context.Context, files []Table, opts *Reconc
 	return c.upload(ctx, fields, files, opts)
 }
 
+// Match pairs the records of two lists that describe the same things in different words (two catalogs, a price
+// book and an invoice): each record on left (the list to go through) with its counterpart on right (the list to
+// search), or reports it has none. opts may be nil. One analysis.
+func (c *Client) Match(ctx context.Context, left, right Table, opts *MatchOptions) (*MatchResult, error) {
+	if opts == nil {
+		opts = &MatchOptions{}
+	}
+	var out MatchResult
+	if left.isRows && right.isRows {
+		body := map[string]any{
+			"left":  map[string]any{"name": left.Name, "rows": left.rows},
+			"right": map[string]any{"name": right.Name, "rows": right.rows},
+		}
+		if len(opts.Weights) > 0 {
+			body["weights"] = opts.Weights
+		}
+		b, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		return &out, c.do(ctx, "POST", "/v1/match", b, "application/json", &out)
+	}
+	payload, ctype, err := multipartBody([]string{"left", "right"}, []Table{left, right}, &ReconcileOptions{Weights: opts.Weights})
+	if err != nil {
+		return nil, err
+	}
+	return &out, c.do(ctx, "POST", "/v1/match", payload, ctype, &out)
+}
+
+// MatchFiles sends two or more lists; TrueUp picks the pair to match and puts the shorter on the left. opts may be
+// nil. One analysis.
+func (c *Client) MatchFiles(ctx context.Context, files []Table, opts *MatchOptions) (*MatchResult, error) {
+	if opts == nil {
+		opts = &MatchOptions{}
+	}
+	fields := make([]string, len(files))
+	for i := range files {
+		fields[i] = "files"
+	}
+	payload, ctype, err := multipartBody(fields, files, &ReconcileOptions{Weights: opts.Weights})
+	if err != nil {
+		return nil, err
+	}
+	var out MatchResult
+	return &out, c.do(ctx, "POST", "/v1/match", payload, ctype, &out)
+}
+
+// MatchStored matches lists already stored in the team, by id. model (a saved match model id) may be "". The run
+// is kept: its id is RunID. One analysis.
+func (c *Client) MatchStored(ctx context.Context, in StoredInput, model string) (*MatchResult, error) {
+	b, err := storedBody(in, &StoredOptions{Model: model})
+	if err != nil {
+		return nil, err
+	}
+	var out MatchResult
+	if err := c.do(ctx, "POST", "/v1/match", b, "application/json", &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // UploadFiles stores one or more files in the team. Each comes back with its ID, Rows, Columns and Roles.
 func (c *Client) UploadFiles(ctx context.Context, files ...Table) ([]StoredFile, error) {
 	if len(files) == 0 {
@@ -479,6 +601,18 @@ func (c *Client) DeleteFile(ctx context.Context, id string) error {
 // ReconcileStored reconciles files already stored in the team, by id. The run is kept: its id is RunID.
 // opts may be nil. One analysis.
 func (c *Client) ReconcileStored(ctx context.Context, in StoredInput, opts *StoredOptions) (*StoredResult, error) {
+	b, err := storedBody(in, opts)
+	if err != nil {
+		return nil, err
+	}
+	var out StoredResult
+	if err := c.do(ctx, "POST", "/v1/reconcile", b, "application/json", &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func storedBody(in StoredInput, opts *StoredOptions) ([]byte, error) {
 	body := map[string]any{}
 	switch {
 	case len(in.FileIDs) > 0:
@@ -494,15 +628,7 @@ func (c *Client) ReconcileStored(ctx context.Context, in StoredInput, opts *Stor
 	if opts != nil && opts.Answers != nil {
 		body["answers"] = opts.Answers
 	}
-	b, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-	var out StoredResult
-	if err := c.do(ctx, "POST", "/v1/reconcile", b, "application/json", &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return json.Marshal(body)
 }
 
 // ListRuns returns one page of runs on stored files, newest first. limit is 1-100 (0 for the default of 100);
@@ -598,19 +724,28 @@ func (c *Client) DeleteModel(ctx context.Context, id string) error {
 }
 
 func (c *Client) upload(ctx context.Context, fields []string, tables []Table, opts *ReconcileOptions) (*ReconcileResult, error) {
+	payload, ctype, err := multipartBody(fields, tables, opts)
+	if err != nil {
+		return nil, err
+	}
+	var out ReconcileResult
+	return &out, c.do(ctx, "POST", "/v1/reconcile", payload, ctype, &out)
+}
+
+func multipartBody(fields []string, tables []Table, opts *ReconcileOptions) ([]byte, string, error) {
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
 	for i, t := range tables {
 		name, content, err := t.file()
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		part, err := w.CreateFormFile(fields[i], name)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		if _, err := part.Write(content); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 	}
 	if len(opts.Weights) > 0 {
@@ -619,15 +754,14 @@ func (c *Client) upload(ctx context.Context, fields []string, tables []Table, op
 	if opts.Answers != nil {
 		b, err := json.Marshal(opts.Answers)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		_ = w.WriteField("answers", string(b))
 	}
 	if err := w.Close(); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	var out ReconcileResult
-	return &out, c.do(ctx, "POST", "/v1/reconcile", buf.Bytes(), w.FormDataContentType(), &out)
+	return buf.Bytes(), w.FormDataContentType(), nil
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body []byte, contentType string, out any) error {

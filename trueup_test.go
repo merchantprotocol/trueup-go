@@ -1,5 +1,5 @@
 // Integration tests against the live TrueUp API. Need TRUEUP_API_KEY (and optionally TRUEUP_BASE_URL).
-// Each full run uses 4 analyses. Run in Docker: `just test` (or `docker compose run --rm test`).
+// Each full run uses 6 analyses. Run in Docker: `just test` (or `docker compose run --rm test`).
 package trueup_test
 
 import (
@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/csv"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -186,5 +187,42 @@ func TestStoredFilesRunsAndModels(t *testing.T) {
 	}
 	if _, err := c.GetModel(ctx, modelID); !errors.Is(err, trueup.ErrNotFound) {
 		t.Fatalf("deleted model: want not found, got %v", err)
+	}
+}
+
+func TestMatchTwoListsThenReuseTheLearning(t *testing.T) {
+	c := live(t)
+	ctx := context.Background()
+	want := [][2]string{{"1", "1"}, {"2", "2"}, {"3", "3"}, {"4", "5"}}
+	pairs := func(r *trueup.MatchResult) [][2]string {
+		out := [][2]string{}
+		for _, p := range r.Details.Pairs {
+			out = append(out, [2]string{p.LeftID, p.RightID})
+		}
+		return out
+	}
+	res, err := c.Match(ctx, trueup.File("testdata/invoice.csv"), trueup.File("testdata/catalog.csv"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Analysis != "match" || fmt.Sprint(pairs(res)) != fmt.Sprint(want) {
+		t.Fatalf("match: %s %v", res.Headline, pairs(res))
+	}
+	var only []string
+	for _, f := range res.Findings {
+		if f.Kind == "only_left" {
+			only = append(only, f.Subject)
+		}
+	}
+	if fmt.Sprint(only) != "[5]" {
+		t.Fatalf("only_left: %v", only)
+	}
+	again, err := c.Match(ctx, trueup.Rows("invoice.csv", rows(t, "testdata/invoice.csv")), trueup.Rows("catalog.csv", rows(t, "testdata/catalog.csv")),
+		&trueup.MatchOptions{Weights: res.Details.Weights})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(pairs(again)) != fmt.Sprint(want) || again.Details.Model.Learned {
+		t.Fatalf("with weights: %v learned=%v", pairs(again), again.Details.Model.Learned)
 	}
 }
