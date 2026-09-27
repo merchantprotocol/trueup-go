@@ -22,6 +22,7 @@ import (
 	"math/rand"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -30,7 +31,7 @@ import (
 )
 
 // Version of this SDK.
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 // DefaultBaseURL is the hosted TrueUp API.
 const DefaultBaseURL = "https://trueup-cloud.merchantprotocol.workers.dev"
@@ -174,6 +175,84 @@ type Plan struct {
 		HardCap              bool   `json:"hard_cap"`
 		OverageMicrosPerUnit *int   `json:"overage_micros_per_unit"`
 	} `json:"limits"`
+}
+
+// StoredFile is a file stored in the team (uploaded through the API or the dashboard).
+type StoredFile struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Size int64  `json:"size"`
+	// Kind is "table" or "document".
+	Kind    string   `json:"kind"`
+	Rows    *int     `json:"rows"`
+	Columns []string `json:"columns"`
+	// Roles is what TrueUp read each column as: "date", "number", "text", ...
+	Roles     map[string]string `json:"roles"`
+	CreatedAt string            `json:"created_at"`
+}
+
+// Run is a run on stored files, from the API or the dashboard.
+type Run struct {
+	ID       string `json:"id"`
+	Analysis string `json:"analysis"`
+	// Status is "done" or "failed".
+	Status string `json:"status"`
+	// Via is "api" or "portal".
+	Via    string   `json:"via"`
+	Inputs []string `json:"inputs"`
+	Model  *struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	} `json:"model"`
+	Headline *string            `json:"headline"`
+	Stats    map[string]float64 `json:"stats"`
+	// Findings is how many findings the run has.
+	Findings  *int    `json:"findings"`
+	Error     *string `json:"error"`
+	CreatedAt string  `json:"created_at"`
+}
+
+// RunPage is one page of runs, newest first.
+type RunPage struct {
+	Runs    []Run `json:"runs"`
+	HasMore bool  `json:"has_more"`
+}
+
+// RunDetail is one run and its full result (nil if the run failed).
+type RunDetail struct {
+	Run    Run              `json:"run"`
+	Result *ReconcileResult `json:"result"`
+}
+
+// Model is a saved model: what a run learned, reusable on next month's files.
+type Model struct {
+	ID          string  `json:"id"`
+	Name        string  `json:"name"`
+	Analysis    string  `json:"analysis"`
+	SourceRunID *string `json:"source_run_id"`
+	CreatedAt   string  `json:"created_at"`
+	// Weights is set only by GetModel.
+	Weights json.RawMessage `json:"weights,omitempty"`
+}
+
+// StoredInput names stored files by id: LeftFileID and RightFileID, or FileIDs for TrueUp to pick the pair.
+type StoredInput struct {
+	LeftFileID  string
+	RightFileID string
+	FileIDs     []string
+}
+
+// StoredOptions are optional settings for ReconcileStored.
+type StoredOptions struct {
+	// Model is a saved model id: apply what it learned instead of learning again.
+	Model   string
+	Answers *Answers
+}
+
+// StoredResult is a reconcile result on stored files, with the id of the run that was kept.
+type StoredResult struct {
+	ReconcileResult
+	RunID string `json:"run_id"`
 }
 
 // ---------------------------------------------------------------- errors
@@ -335,6 +414,189 @@ func (c *Client) ReconcileFiles(ctx context.Context, files []Table, opts *Reconc
 	return c.upload(ctx, fields, files, opts)
 }
 
+// UploadFiles stores one or more files in the team. Each comes back with its ID, Rows, Columns and Roles.
+func (c *Client) UploadFiles(ctx context.Context, files ...Table) ([]StoredFile, error) {
+	if len(files) == 0 {
+		return nil, &Error{Code: "invalid_request", Message: "pass at least one file to upload", kind: ErrInvalidRequest}
+	}
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	for _, t := range files {
+		name, content, err := t.file()
+		if err != nil {
+			return nil, err
+		}
+		part, err := w.CreateFormFile("file", name)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := part.Write(content); err != nil {
+			return nil, err
+		}
+	}
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+	var out struct {
+		Files []StoredFile `json:"files"`
+	}
+	err := c.do(ctx, "POST", "/v1/files", buf.Bytes(), w.FormDataContentType(), &out)
+	return out.Files, err
+}
+
+// ListFiles returns the team's stored files.
+func (c *Client) ListFiles(ctx context.Context) ([]StoredFile, error) {
+	var out struct {
+		Files []StoredFile `json:"files"`
+	}
+	err := c.do(ctx, "GET", "/v1/files", nil, "", &out)
+	return out.Files, err
+}
+
+// GetFile returns one stored file.
+func (c *Client) GetFile(ctx context.Context, id string) (*StoredFile, error) {
+	var out struct {
+		File StoredFile `json:"file"`
+	}
+	if err := c.do(ctx, "GET", "/v1/files/"+url.PathEscape(id), nil, "", &out); err != nil {
+		return nil, err
+	}
+	return &out.File, nil
+}
+
+// FileContent returns a stored file's bytes, exactly as uploaded.
+func (c *Client) FileContent(ctx context.Context, id string) ([]byte, error) {
+	var out []byte
+	err := c.do(ctx, "GET", "/v1/files/"+url.PathEscape(id)+"/content", nil, "", &out)
+	return out, err
+}
+
+// DeleteFile deletes a stored file.
+func (c *Client) DeleteFile(ctx context.Context, id string) error {
+	return c.do(ctx, "DELETE", "/v1/files/"+url.PathEscape(id), nil, "", nil)
+}
+
+// ReconcileStored reconciles files already stored in the team, by id. The run is kept: its id is RunID.
+// opts may be nil. One analysis.
+func (c *Client) ReconcileStored(ctx context.Context, in StoredInput, opts *StoredOptions) (*StoredResult, error) {
+	body := map[string]any{}
+	switch {
+	case len(in.FileIDs) > 0:
+		body["file_ids"] = in.FileIDs
+	case in.LeftFileID != "" && in.RightFileID != "":
+		body["left_file_id"], body["right_file_id"] = in.LeftFileID, in.RightFileID
+	default:
+		return nil, &Error{Code: "invalid_request", Message: "set LeftFileID and RightFileID, or FileIDs", kind: ErrInvalidRequest}
+	}
+	if opts != nil && opts.Model != "" {
+		body["model"] = opts.Model
+	}
+	if opts != nil && opts.Answers != nil {
+		body["answers"] = opts.Answers
+	}
+	b, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	var out StoredResult
+	if err := c.do(ctx, "POST", "/v1/reconcile", b, "application/json", &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ListRuns returns one page of runs on stored files, newest first. limit is 1-100 (0 for the default of 100);
+// before is a run id ("" for the newest).
+func (c *Client) ListRuns(ctx context.Context, limit int, before string) (*RunPage, error) {
+	q := url.Values{}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	if before != "" {
+		q.Set("before", before)
+	}
+	path := "/v1/runs"
+	if len(q) > 0 {
+		path += "?" + q.Encode()
+	}
+	var out RunPage
+	if err := c.do(ctx, "GET", path, nil, "", &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// AllRuns calls fn for every run, newest first, fetching page after page. Return false from fn to stop.
+func (c *Client) AllRuns(ctx context.Context, fn func(Run) bool) error {
+	before := ""
+	for {
+		page, err := c.ListRuns(ctx, 100, before)
+		if err != nil {
+			return err
+		}
+		for _, r := range page.Runs {
+			if !fn(r) {
+				return nil
+			}
+		}
+		if !page.HasMore || len(page.Runs) == 0 {
+			return nil
+		}
+		before = page.Runs[len(page.Runs)-1].ID
+	}
+}
+
+// GetRun returns one run and its full result.
+func (c *Client) GetRun(ctx context.Context, id string) (*RunDetail, error) {
+	var out RunDetail
+	if err := c.do(ctx, "GET", "/v1/runs/"+url.PathEscape(id), nil, "", &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// CreateModel saves what a run learned as a model and returns the model's id.
+func (c *Client) CreateModel(ctx context.Context, runID, name string) (string, error) {
+	body := map[string]string{"run_id": runID}
+	if name != "" {
+		body["name"] = name
+	}
+	b, err := json.Marshal(body)
+	if err != nil {
+		return "", err
+	}
+	var out struct {
+		ID string `json:"id"`
+	}
+	err = c.do(ctx, "POST", "/v1/models", b, "application/json", &out)
+	return out.ID, err
+}
+
+// ListModels returns the team's saved models.
+func (c *Client) ListModels(ctx context.Context) ([]Model, error) {
+	var out struct {
+		Models []Model `json:"models"`
+	}
+	err := c.do(ctx, "GET", "/v1/models", nil, "", &out)
+	return out.Models, err
+}
+
+// GetModel returns one saved model, including its Weights.
+func (c *Client) GetModel(ctx context.Context, id string) (*Model, error) {
+	var out struct {
+		Model Model `json:"model"`
+	}
+	if err := c.do(ctx, "GET", "/v1/models/"+url.PathEscape(id), nil, "", &out); err != nil {
+		return nil, err
+	}
+	return &out.Model, nil
+}
+
+// DeleteModel deletes a saved model.
+func (c *Client) DeleteModel(ctx context.Context, id string) error {
+	return c.do(ctx, "DELETE", "/v1/models/"+url.PathEscape(id), nil, "", nil)
+}
+
 func (c *Client) upload(ctx context.Context, fields []string, tables []Table, opts *ReconcileOptions) (*ReconcileResult, error) {
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
@@ -399,6 +661,13 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte, conte
 			return &Error{Code: "connection_error", kind: ErrConnection, Message: err.Error()}
 		}
 		if res.StatusCode >= 200 && res.StatusCode < 300 {
+			if raw, ok := out.(*[]byte); ok {
+				*raw = data
+				return nil
+			}
+			if out == nil {
+				return nil
+			}
 			return json.Unmarshal(data, out)
 		}
 		var envelope struct {
