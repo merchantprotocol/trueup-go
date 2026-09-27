@@ -78,6 +78,33 @@ client.Reconcile(ctx, trueup.File("statement.csv"), trueup.File("receiving.csv")
 
 Each call to `Reconcile` or `ReconcileFiles` counts as one analysis on your plan.
 
+## Stored files, runs and saved models
+
+Files uploaded to your team stay there (you'll also see them in the dashboard). Runs on stored files are kept, and what a run learned can be saved as a model:
+
+```go
+files, err := client.UploadFiles(ctx, trueup.File("statement.csv"), trueup.File("receiving.csv"))
+statement, receiving := files[0], files[1]   // statement.Rows, .Columns, .Roles ("Qty": "number", ...)
+
+res, err := client.ReconcileStored(ctx, trueup.StoredInput{LeftFileID: statement.ID, RightFileID: receiving.ID}, nil)
+modelID, err := client.CreateModel(ctx, res.RunID, "Acme statements")
+
+// Next month: apply what was learned.
+client.ReconcileStored(ctx, trueup.StoredInput{FileIDs: []string{aprilStatement.ID, aprilReceiving.ID}},
+	&trueup.StoredOptions{Model: modelID})
+```
+
+| Method | Returns |
+|---|---|
+| `UploadFiles(ctx, tables...)`, `ListFiles(ctx)`, `GetFile(ctx, id)` | `StoredFile`: `ID`, `Name`, `Rows`, `Columns`, `Roles` |
+| `FileContent(ctx, id)` | the bytes, exactly as uploaded |
+| `DeleteFile(ctx, id)` | |
+| `ReconcileStored(ctx, StoredInput, *StoredOptions)` | `StoredResult`: a result plus `RunID` (one analysis) |
+| `ListRuns(ctx, limit, before)` | `RunPage`: `Runs`, `HasMore`, newest first |
+| `AllRuns(ctx, func(Run) bool)` | calls you for every run, paging for you |
+| `GetRun(ctx, id)` | `RunDetail`: `Run`, `Result` |
+| `CreateModel(ctx, runID, name)`, `ListModels(ctx)`, `GetModel(ctx, id)`, `DeleteModel(ctx, id)` | `GetModel` includes the `Weights` |
+
 ## Findings
 
 | `Kind` | Meaning |
@@ -131,7 +158,7 @@ trueup.NewClient(
 The tests run in Docker against the live API:
 
 ```bash
-export TRUEUP_API_KEY=tu_live_...   # a key for a test team (each run uses 2 analyses)
+export TRUEUP_API_KEY=tu_live_...   # a key for a test team (each run uses 4 analyses)
 just test                            # or: docker compose run --rm test
 ```
 

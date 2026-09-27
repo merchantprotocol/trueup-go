@@ -1,10 +1,11 @@
 // Integration tests against the live TrueUp API. Need TRUEUP_API_KEY (and optionally TRUEUP_BASE_URL).
-// Each full run uses 2 analyses. Run in Docker: `just test` (or `docker compose run --rm test`).
+// Each full run uses 4 analyses. Run in Docker: `just test` (or `docker compose run --rm test`).
 package trueup_test
 
 import (
 	"context"
 	"encoding/csv"
+	"bytes"
 	"errors"
 	"os"
 	"strings"
@@ -121,5 +122,69 @@ func TestErrorsAreTyped(t *testing.T) {
 	_, err = c.Reconcile(ctx, trueup.File("testdata/statement.csv"), trueup.Content("scan.pdf", []byte("%PDF-1.4")), nil)
 	if !errors.As(err, &e) || e.Status != 422 || e.Code != "unsupported_file" || !errors.Is(err, trueup.ErrInvalidRequest) {
 		t.Fatalf("want 422 unsupported_file, got %v", err)
+	}
+}
+
+func TestStoredFilesRunsAndModels(t *testing.T) {
+	c := live(t)
+	ctx := context.Background()
+	files, err := c.UploadFiles(ctx, trueup.File("testdata/statement.csv"), trueup.File("testdata/receiving.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	statement, receiving := files[0], files[1]
+	defer func() {
+		_ = c.DeleteFile(ctx, statement.ID)
+		_ = c.DeleteFile(ctx, receiving.ID)
+		if _, err := c.GetFile(ctx, statement.ID); !errors.Is(err, trueup.ErrNotFound) {
+			t.Errorf("deleted file: want not found, got %v", err)
+		}
+	}()
+	if statement.Rows == nil || *statement.Rows != 8 || statement.Roles["Qty"] != "number" {
+		t.Fatalf("statement: %+v", statement)
+	}
+	if f, err := c.GetFile(ctx, receiving.ID); err != nil || f.Name != "receiving.csv" {
+		t.Fatalf("get file: %v %v", f, err)
+	}
+	content, err := c.FileContent(ctx, statement.ID)
+	want, _ := os.ReadFile("testdata/statement.csv")
+	if err != nil || !bytes.Equal(content, want) {
+		t.Fatalf("content differs: %v", err)
+	}
+
+	res, err := c.ReconcileStored(ctx, trueup.StoredInput{LeftFileID: statement.ID, RightFileID: receiving.ID}, nil)
+	if err != nil || res.Stats["paired"] != 7 || !strings.HasPrefix(res.RunID, "run_") {
+		t.Fatalf("reconcile stored: %v %v", res, err)
+	}
+	run, err := c.GetRun(ctx, res.RunID)
+	if err != nil || run.Run.Status != "done" || run.Result.Stats["paired"] != 7 {
+		t.Fatalf("get run: %v %v", run, err)
+	}
+	page, err := c.ListRuns(ctx, 1, "")
+	if err != nil || len(page.Runs) != 1 || !page.HasMore {
+		t.Fatalf("runs page: %v %v", page, err)
+	}
+	next, err := c.ListRuns(ctx, 1, page.Runs[0].ID)
+	if err != nil || next.Runs[0].ID == page.Runs[0].ID {
+		t.Fatalf("next page: %v %v", next, err)
+	}
+
+	modelID, err := c.CreateModel(ctx, res.RunID, "sdk test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := c.GetModel(ctx, modelID)
+	if err != nil || !strings.Contains(string(m.Weights), `"trueup.match-weights"`) {
+		t.Fatalf("get model: %v", err)
+	}
+	again, err := c.ReconcileStored(ctx, trueup.StoredInput{FileIDs: []string{statement.ID, receiving.ID}}, &trueup.StoredOptions{Model: modelID})
+	if err != nil || again.Details.Model["learned"] != false {
+		t.Fatalf("with model: %v", err)
+	}
+	if err := c.DeleteModel(ctx, modelID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.GetModel(ctx, modelID); !errors.Is(err, trueup.ErrNotFound) {
+		t.Fatalf("deleted model: want not found, got %v", err)
 	}
 }
