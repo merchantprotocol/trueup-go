@@ -114,6 +114,22 @@ client.Audit(ctx, []trueup.Table{trueup.File("inv-1050.txt")}, &trueup.AuditOpti
 
 `AuditStored(ctx, fileIDs, model)` audits stored files. One analysis per call.
 
+## Estimate
+
+Price a new job from your past estimates. Send a domain file for the trade (a `.tu` file naming the facts to read, what costs scale with, and the cost categories), at least 3 past estimates in any format (CSV, TSV, Markdown, JSON, or text proposals), and one request describing the new job in plain words:
+
+```go
+files := []trueup.Table{trueup.File("barndo.tu"), trueup.File("01_anderson.csv"), /* … */ trueup.File("job_a.txt")}
+res, err := client.Estimate(ctx, files, nil)
+fmt.Println(res.Headline)
+// job_a.txt: $292,267 (80% range $248,742 – $335,792) from 10 past estimates.
+
+// The next job, with what was learned (no need to send the history again):
+client.Estimate(ctx, []trueup.Table{trueup.File("job_b.txt")}, &trueup.EstimateOptions{Weights: res.Details.Weights})
+```
+
+`EstimateStored(ctx, fileIDs, model)` prices from stored files. One analysis per call.
+
 ## Stored files, runs and saved models
 
 Files uploaded to your team stay there (you'll also see them in the dashboard). Runs on stored files are kept, and what a run learned can be saved as a model:
@@ -194,7 +210,7 @@ trueup.NewClient(
 The tests run in Docker against the live API:
 
 ```bash
-export TRUEUP_API_KEY=tu_live_...   # a key for a test team (each run uses 8 analyses)
+export TRUEUP_API_KEY=tu_live_...   # a key for a test team (each run uses 10 analyses)
 just test                            # or: docker compose run --rm test
 ```
 

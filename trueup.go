@@ -31,7 +31,7 @@ import (
 )
 
 // Version of this SDK.
-const Version = "0.4.0"
+const Version = "0.5.0"
 
 // DefaultBaseURL is the hosted TrueUp API.
 const DefaultBaseURL = "https://trueup-cloud.merchantprotocol.workers.dev"
@@ -268,6 +268,42 @@ type AuditDetails struct {
 
 // AuditOptions are optional settings for an audit call.
 type AuditOptions struct {
+	Weights json.RawMessage
+}
+
+// EstimateResult is the answer to an estimate call: the new job priced part by part, with an 80% range.
+type EstimateResult struct {
+	Analysis string `json:"analysis"`
+	Title    string `json:"title"`
+	Headline string `json:"headline"`
+	// Stats: total, low, high (the 80% range), categories priced, past estimates, ...
+	Stats map[string]float64 `json:"stats"`
+	// Findings: Kind "priced_line" is one cost category (Amount is its price); status "unsure" is for a person.
+	Findings []Finding       `json:"findings"`
+	Details  EstimateDetails `json:"details"`
+	Inputs   []string        `json:"inputs"`
+	Engine   string          `json:"engine"`
+	RunID    string          `json:"run_id"`
+}
+
+// EstimateDetails are the job's scope, its total, and what was learned.
+type EstimateDetails struct {
+	Scope []struct {
+		Category   string  `json:"category"`
+		Include    bool    `json:"include"`
+		Confidence float64 `json:"confidence"`
+		Why        string  `json:"why"`
+	} `json:"scope"`
+	Total map[string]any `json:"total"`
+	Model struct {
+		Learned bool `json:"learned"`
+	} `json:"model"`
+	// Weights: the trade and its labeled past estimates; pass back as EstimateOptions.Weights with just a request.
+	Weights json.RawMessage `json:"weights"`
+}
+
+// EstimateOptions are optional settings for an estimate call.
+type EstimateOptions struct {
 	Weights json.RawMessage
 }
 
@@ -602,6 +638,43 @@ func (c *Client) AuditStored(ctx context.Context, fileIDs []string, model string
 	}
 	var out AuditResult
 	if err := c.do(ctx, "POST", "/v1/audit", b, "application/json", &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Estimate prices a new job from past estimates: a domain file for the trade (.tu), at least 3 past estimates in any
+// format, and one request describing the new job; or, with opts.Weights, just the request. One analysis.
+func (c *Client) Estimate(ctx context.Context, files []Table, opts *EstimateOptions) (*EstimateResult, error) {
+	if len(files) == 0 {
+		return nil, &Error{Code: "invalid_request", Message: "pass the domain file, past estimates and the request", kind: ErrInvalidRequest}
+	}
+	if opts == nil {
+		opts = &EstimateOptions{}
+	}
+	fields := make([]string, len(files))
+	for i := range files {
+		fields[i] = "files"
+	}
+	payload, ctype, err := multipartBody(fields, files, &ReconcileOptions{Weights: opts.Weights})
+	if err != nil {
+		return nil, err
+	}
+	var out EstimateResult
+	if err := c.do(ctx, "POST", "/v1/estimate", payload, ctype, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// EstimateStored prices from files already stored in the team, by id. model (a saved estimate model id) may be "".
+func (c *Client) EstimateStored(ctx context.Context, fileIDs []string, model string) (*EstimateResult, error) {
+	b, err := storedBody(StoredInput{FileIDs: fileIDs}, &StoredOptions{Model: model})
+	if err != nil {
+		return nil, err
+	}
+	var out EstimateResult
+	if err := c.do(ctx, "POST", "/v1/estimate", b, "application/json", &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
