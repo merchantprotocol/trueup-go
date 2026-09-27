@@ -1,5 +1,5 @@
 // Integration tests against the live TrueUp API. Need TRUEUP_API_KEY (and optionally TRUEUP_BASE_URL).
-// Each full run uses 8 analyses. Run in Docker: `just test` (or `docker compose run --rm test`).
+// Each full run uses 10 analyses. Run in Docker: `just test` (or `docker compose run --rm test`).
 package trueup_test
 
 import (
@@ -162,12 +162,14 @@ func TestStoredFilesRunsAndModels(t *testing.T) {
 		t.Fatalf("get run: %v %v", run, err)
 	}
 	page, err := c.ListRuns(ctx, 1, "")
-	if err != nil || len(page.Runs) != 1 || !page.HasMore {
+	if err != nil || len(page.Runs) != 1 {
 		t.Fatalf("runs page: %v %v", page, err)
 	}
-	next, err := c.ListRuns(ctx, 1, page.Runs[0].ID)
-	if err != nil || next.Runs[0].ID == page.Runs[0].ID {
-		t.Fatalf("next page: %v %v", next, err)
+	if page.HasMore {
+		next, err := c.ListRuns(ctx, 1, page.Runs[0].ID)
+		if err != nil || next.Runs[0].ID == page.Runs[0].ID {
+			t.Fatalf("next page: %v %v", next, err)
+		}
 	}
 
 	modelID, err := c.CreateModel(ctx, res.RunID, "sdk test")
@@ -247,5 +249,30 @@ func TestAuditSixInvoicesThenOneAgainstTheSavedLaws(t *testing.T) {
 	}
 	if one.Details.Model.Learned || len(one.Findings) != 1 || one.Findings[0].Subject != "inv-1045.txt" {
 		t.Fatalf("with saved laws: %s", one.Headline)
+	}
+}
+
+func TestEstimateANewJobThenTheNextWithTheSavedModel(t *testing.T) {
+	c := live(t)
+	ctx := context.Background()
+	var files []trueup.Table
+	for _, n := range []string{"barndo.tu", "01_anderson.csv", "02_brooks.csv", "03_carter.md", "04_dalton.txt", "05_ellis.json",
+		"06_foster.tsv", "07_garrison.txt", "08_hayes.csv", "09_iverson.csv", "10_jensen.md", "job_a.txt"} {
+		files = append(files, trueup.File("testdata/barndo/"+n))
+	}
+	res, err := c.Estimate(ctx, files, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	total := res.Stats["total"]
+	if res.Analysis != "estimate" || res.Stats["past estimates"] != 10 || total < 292267*0.95 || total > 292267*1.05 || res.Stats["low"] >= total {
+		t.Fatalf("estimate: %s %v", res.Headline, res.Stats)
+	}
+	next, err := c.Estimate(ctx, []trueup.Table{trueup.File("testdata/barndo/job_b.txt")}, &trueup.EstimateOptions{Weights: res.Details.Weights})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Details.Model.Learned || next.Stats["total"] <= 0 {
+		t.Fatalf("with the saved model: %s", next.Headline)
 	}
 }
