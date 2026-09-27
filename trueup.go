@@ -31,7 +31,7 @@ import (
 )
 
 // Version of this SDK.
-const Version = "0.3.0"
+const Version = "0.4.0"
 
 // DefaultBaseURL is the hosted TrueUp API.
 const DefaultBaseURL = "https://trueup-cloud.merchantprotocol.workers.dev"
@@ -235,6 +235,39 @@ func (p *MatchPair) UnmarshalJSON(b []byte) error {
 // MatchOptions are optional settings for a match call.
 type MatchOptions struct {
 	// Weights is Details.Weights from an earlier match: apply what was learned then instead of learning again.
+	Weights json.RawMessage
+}
+
+// AuditResult is the answer to an audit call: documents (Analysis "audit") or a table's rows ("table-audit").
+type AuditResult struct {
+	Analysis string             `json:"analysis"`
+	Title    string             `json:"title"`
+	Headline string             `json:"headline"`
+	Stats    map[string]float64 `json:"stats"`
+	// Findings: Kind is arithmetic (the numbers break a law; Amount is how far off) or duplicate_row.
+	Findings []Finding    `json:"findings"`
+	Details  AuditDetails `json:"details"`
+	Inputs   []string     `json:"inputs"`
+	Engine   string       `json:"engine"`
+	RunID    string       `json:"run_id"`
+}
+
+// AuditDetails are the laws learned (or applied) and what to pass back to apply them again.
+type AuditDetails struct {
+	Laws []struct {
+		Scope string `json:"scope"`
+		Law   string `json:"law"`
+		Held  string `json:"held"`
+	} `json:"laws"`
+	Model struct {
+		Learned bool `json:"learned"`
+	} `json:"model"`
+	// Weights: pass back as AuditOptions.Weights to check new documents against the same laws.
+	Weights json.RawMessage `json:"weights"`
+}
+
+// AuditOptions are optional settings for an audit call.
+type AuditOptions struct {
 	Weights json.RawMessage
 }
 
@@ -531,6 +564,44 @@ func (c *Client) MatchStored(ctx context.Context, in StoredInput, model string) 
 	}
 	var out MatchResult
 	if err := c.do(ctx, "POST", "/v1/match", b, "application/json", &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Audit finds what doesn't add up. Text documents (invoices, statements, 4 or more of a kind): TrueUp learns the
+// arithmetic each kind obeys and flags the ones that break it. One table: the same for its rows, plus repeated
+// rows. opts may be nil. One analysis.
+func (c *Client) Audit(ctx context.Context, files []Table, opts *AuditOptions) (*AuditResult, error) {
+	if len(files) == 0 {
+		return nil, &Error{Code: "invalid_request", Message: "pass the documents (or one table) to audit", kind: ErrInvalidRequest}
+	}
+	if opts == nil {
+		opts = &AuditOptions{}
+	}
+	fields := make([]string, len(files))
+	for i := range files {
+		fields[i] = "files"
+	}
+	payload, ctype, err := multipartBody(fields, files, &ReconcileOptions{Weights: opts.Weights})
+	if err != nil {
+		return nil, err
+	}
+	var out AuditResult
+	if err := c.do(ctx, "POST", "/v1/audit", payload, ctype, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// AuditStored audits files already stored in the team, by id. model (a saved audit model id) may be "".
+func (c *Client) AuditStored(ctx context.Context, fileIDs []string, model string) (*AuditResult, error) {
+	b, err := storedBody(StoredInput{FileIDs: fileIDs}, &StoredOptions{Model: model})
+	if err != nil {
+		return nil, err
+	}
+	var out AuditResult
+	if err := c.do(ctx, "POST", "/v1/audit", b, "application/json", &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

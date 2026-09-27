@@ -1,5 +1,5 @@
 // Integration tests against the live TrueUp API. Need TRUEUP_API_KEY (and optionally TRUEUP_BASE_URL).
-// Each full run uses 6 analyses. Run in Docker: `just test` (or `docker compose run --rm test`).
+// Each full run uses 8 analyses. Run in Docker: `just test` (or `docker compose run --rm test`).
 package trueup_test
 
 import (
@@ -224,5 +224,28 @@ func TestMatchTwoListsThenReuseTheLearning(t *testing.T) {
 	}
 	if fmt.Sprint(pairs(again)) != fmt.Sprint(want) || again.Details.Model.Learned {
 		t.Fatalf("with weights: %v learned=%v", pairs(again), again.Details.Model.Learned)
+	}
+}
+
+func TestAuditSixInvoicesThenOneAgainstTheSavedLaws(t *testing.T) {
+	c := live(t)
+	ctx := context.Background()
+	var files []trueup.Table
+	for i := 1; i <= 6; i++ {
+		files = append(files, trueup.File(fmt.Sprintf("testdata/invoices/inv-104%d.txt", i)))
+	}
+	res, err := c.Audit(ctx, files, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Analysis != "audit" || len(res.Findings) != 1 || res.Findings[0].Subject != "inv-1045.txt" || *res.Findings[0].Amount != 200 {
+		t.Fatalf("audit: %s %+v", res.Headline, res.Findings)
+	}
+	one, err := c.Audit(ctx, []trueup.Table{trueup.File("testdata/invoices/inv-1045.txt")}, &trueup.AuditOptions{Weights: res.Details.Weights})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if one.Details.Model.Learned || len(one.Findings) != 1 || one.Findings[0].Subject != "inv-1045.txt" {
+		t.Fatalf("with saved laws: %s", one.Headline)
 	}
 }
